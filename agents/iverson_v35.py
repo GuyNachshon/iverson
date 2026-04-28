@@ -67,6 +67,7 @@ class IversonV35(Agent):
         # Pending transition for per-step update.
         self._prev_frame: Optional[Frame] = None
         self._prev_action: Optional[int] = None
+        self._prev_click_color: Optional[int] = None
         self._prev_levels: int = 0
 
         self._step_idx = 0
@@ -98,6 +99,7 @@ class IversonV35(Agent):
                 before=self._prev_frame, after=current_frame,
                 levels_increased=levels_increased,
                 step=self._step_idx,
+                click_color=self._prev_click_color,
             )
             self._prev_levels = latest_frame.levels_completed
 
@@ -125,9 +127,13 @@ class IversonV35(Agent):
 
     def _score_actions(self, frame: Frame, avail: list[int]) -> dict[int, float]:
         scores: dict[int, float] = {}
+        # Look ahead at what color we'd click (if action is ACTION6) so the
+        # rule store's click_color_progresses rules can fire.
+        peek_click_color = self._peek_click_color(frame) if COMPLEX_ID in avail else None
         for action_id in avail:
             base = 1.0
-            rule_score = self.rule_store.suggest(frame, action_id)
+            click_color = peek_click_color if action_id == COMPLEX_ID else None
+            rule_score = self.rule_store.suggest(frame, action_id, click_color=click_color)
             sal_score = saliency_score_action(frame, action_id)
             novelty_score = self.state_graph.novelty(frame, action_id)
             jitter = self.np_rng.uniform(0, 1)
@@ -146,19 +152,83 @@ class IversonV35(Agent):
             scores[action_id] = float(score)
         return scores
 
+    def _peek_click_color(self, frame: Frame) -> Optional[int]:
+        """Predict what color we'd click if we picked ACTION6 right now."""
+        x, y = self._compute_click_target(frame, peek_only=True)
+        # Find which object's centroid is closest to (x, y) and return its color.
+        if not frame.objects:
+            return None
+        H, W = frame.grid_shape
+        best_obj_idx = None
+        best_d = 1e9
+        for i, obj in enumerate(frame.objects):
+            ox = obj.centroid_norm[0] * (W - 1)
+            oy = obj.centroid_norm[1] * (H - 1)
+            d = (ox - x) ** 2 + (oy - y) ** 2
+            if d < best_d:
+                best_d = d
+                best_obj_idx = i
+        return frame.objects[best_obj_idx].color_id if best_obj_idx is not None else None
+
     def _build_action(self, action_id: int, frame: Frame) -> GameAction:
         if action_id == RESET_ID:
             return GameAction.RESET
         action = GameAction.from_id(action_id)
         if action.is_complex():
-            x, y = self._pick_click_target(frame)
+            x, y = self._compute_click_target(frame, peek_only=False)
             action.set_data({"x": int(x), "y": int(y)})
             action.reasoning = {"src": "v3.5", "click_x": int(x), "click_y": int(y)}
+            # Stash the click color for rule induction on the next step.
+            self._prev_click_color = self._color_at_target(frame, x, y)
         else:
             action.reasoning = "v3.5"
+            self._prev_click_color = None
         return action
 
-    def _pick_click_target(self, frame: Frame) -> tuple[int, int]:
+    def _color_at_target(self, frame: Frame, x: int, y: int) -> Optional[int]:
+        if not frame.objects:
+            return None
+        H, W = frame.grid_shape
+        best_obj_idx = None
+        best_d = 1e9
+        for i, obj in enumerate(frame.objects):
+            ox = obj.centroid_norm[0] * (W - 1)
+            oy = obj.centroid_norm[1] * (H - 1)
+            d = (ox - x) ** 2 + (oy - y) ** 2
+            if d < best_d:
+                best_d = d
+                best_obj_idx = i
+        return frame.objects[best_obj_idx].color_id if best_obj_idx is not None else None
+
+    def _compute_click_target(self, frame: Frame, peek_only: bool = False
+                                ) -> tuple[int, int]:
+        """Pick a click target.
+
+        If we've learned a high-confidence `click_color_progresses(C)` rule,
+        prefer clicking on an object of color C. Otherwise fall back to the
+        cycling-saliency strategy.
+
+        `peek_only=True`: don't update self._used_click_targets (used by
+        _peek_click_color when scoring actions).
+        """
+        # Rule-driven: if we have a strong click-color rule, target objects of that color.
+        preferred_color = self.rule_store.best_click_color(action_key=COMPLEX_ID)
+        if preferred_color is not None:
+            for obj in frame.objects:
+                if obj.color_id == preferred_color:
+                    H, W = frame.grid_shape
+                    x = int(round(obj.centroid_norm[0] * (W - 1)))
+                    y = int(round(obj.centroid_norm[1] * (H - 1)))
+                    x = max(0, min(63, x))
+                    y = max(0, min(63, y))
+                    if not peek_only:
+                        self._used_click_targets.append((x, y))
+                    return x, y
+        # Else fallback to saliency cycling.
+        return self._pick_click_target_by_saliency(frame, peek_only=peek_only)
+
+    def _pick_click_target_by_saliency(self, frame: Frame, peek_only: bool = False
+                                        ) -> tuple[int, int]:
         """Pick a click target.
 
         Strategy: rank objects by saliency, pick the i-th one where i =
@@ -199,5 +269,6 @@ class IversonV35(Agent):
         y = int(round(obj.centroid_norm[1] * (H - 1)))
         x = max(0, min(63, x))
         y = max(0, min(63, y))
-        self._used_click_targets.append((x, y))
+        if not peek_only:
+            self._used_click_targets.append((x, y))
         return x, y

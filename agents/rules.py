@@ -42,6 +42,15 @@ class Effect:
         return cls(kind="level_progress")
 
     @classmethod
+    def click_color_progresses(cls, color_id: int) -> "Effect":
+        """ACTION6 clicked at a cell of `color_id` → level progress.
+
+        Specific to ACTION6 + click_color preconditioned rules — the
+        bt33-shaped rule ('clicking the left button advances').
+        """
+        return cls(kind="click_color_progresses", color_id=color_id)
+
+    @classmethod
     def no_op(cls) -> "Effect":
         return cls(kind="no_op")
 
@@ -167,7 +176,8 @@ class RuleStore:
         return r
 
     def induce(self, action_key: int, before: Frame, after: Frame,
-                levels_increased: bool, step: int = -1) -> list[Rule]:
+                levels_increased: bool, step: int = -1,
+                click_color: Optional[int] = None) -> list[Rule]:
         """Generate candidate rules from this transition; record observations.
 
         We propose rules from the same set of templates each time:
@@ -203,6 +213,14 @@ class RuleStore:
         r = self.add_or_update(action_key, Effect.level_progress(), levels_increased, step)
         rules_touched.append(r)
 
+        # click_color_progresses (ACTION6 specific)
+        if action_key == 6 and click_color is not None:
+            r = self.add_or_update(
+                action_key, Effect.click_color_progresses(click_color),
+                levels_increased, step,
+            )
+            rules_touched.append(r)
+
         # no_op
         r = self.add_or_update(action_key, Effect.no_op(), delta == 0, step)
         rules_touched.append(r)
@@ -211,24 +229,42 @@ class RuleStore:
 
     # ---- Action scoring ----
 
-    def suggest(self, frame: Frame, action_key: int) -> float:
+    # Per-effect minimum support thresholds. click_color_progresses is the
+    # bt33-shaped rule — even 1 observation is informative (you don't accidentally
+    # win a level by clicking).
+    _MIN_SUPPORT = {
+        "level_progress": 1,
+        "click_color_progresses": 1,
+        "color_removed": 2,
+        "global_delta": 2,
+        "no_op": 2,
+    }
+
+    def suggest(self, frame: Frame, action_key: int,
+                click_color: Optional[int] = None) -> float:
         """Score an action by the rules that fire at this state.
 
         Higher = the rule store thinks this action is useful. Combines:
           - level_progress confidence (huge, if rules say this action wins levels)
           - global_delta(>=4) confidence (medium, "this action does meaningful stuff")
           - global_delta(>=16) confidence (large delta = often interaction with goal)
+          - click_color_progresses(C) when click_color matches: very high
           - subtract no_op confidence (penalize "this action does nothing")
         """
         score = 0.0
         for r in self.rules:
             if r.action_key != action_key:
                 continue
-            if r.support < 2:
-                continue  # don't trust 1-shot rules
+            min_support = self._MIN_SUPPORT.get(r.effect.kind, 2)
+            if r.support < min_support:
+                continue
             c = r.confidence
             if r.effect.kind == "level_progress":
                 score += 5.0 * c
+            elif r.effect.kind == "click_color_progresses":
+                if click_color is not None and r.effect.color_id == click_color:
+                    # Strong: this rule has fired before with this exact click color.
+                    score += 8.0 * c
             elif r.effect.kind == "global_delta":
                 if r.effect.min_cells == 1:
                     score += 0.5 * c
@@ -237,12 +273,32 @@ class RuleStore:
                 elif r.effect.min_cells == 16:
                     score += 2.0 * c
             elif r.effect.kind == "color_removed":
-                # Only relevant if the color is present in the current frame.
                 if any(o.color_id == r.effect.color_id for o in frame.objects):
                     score += 1.5 * c
             elif r.effect.kind == "no_op":
                 score -= 2.0 * c
         return score
+
+    def best_click_color(self, action_key: int = 6) -> Optional[int]:
+        """If we have a high-confidence click_color_progresses rule, return its color.
+
+        Used at click-target picking time: bias toward clicking on a cell of
+        that color.
+        """
+        best: Optional[Rule] = None
+        best_score = -1.0
+        for r in self.rules:
+            if r.action_key != action_key:
+                continue
+            if r.effect.kind != "click_color_progresses":
+                continue
+            if r.support < 1 or r.confidence < 0.5:
+                continue
+            score = r.confidence * (1.0 + 0.3 * r.support)
+            if score > best_score:
+                best = r
+                best_score = score
+        return best.effect.color_id if best else None
 
     def stats(self) -> dict:
         kinds: dict[str, int] = {}
