@@ -16,6 +16,7 @@ from arc_agi import OperationMode
 from agents.base import GameResult, make_arcade, run_agent
 from agents.iverson_v25 import IversonV25
 from agents.iverson_v3 import IversonV3
+from agents.iverson_v35 import IversonV35
 from agents.random_baseline import RandomBaseline
 
 
@@ -30,12 +31,14 @@ def build_agent(name: str, game_id: str, baseline_actions: list[int],
             raise ValueError("v3 requires --ckpt path to a trained predictor")
         return IversonV3(game_id=game_id, baseline_actions=baseline_actions,
                           ckpt_path=ckpt, seed=0)
+    if name == "v35":
+        return IversonV35(game_id=game_id, baseline_actions=baseline_actions, seed=0)
     raise ValueError(f"unknown agent: {name}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--agent", default="random", choices=["random", "v25", "v3"])
+    parser.add_argument("--agent", default="random", choices=["random", "v25", "v3", "v35"])
     parser.add_argument("--ckpt", default=None,
                         help="path to predictor checkpoint (required for v3)")
     parser.add_argument("--game", default=None, help="prefix filter, comma-separated")
