@@ -1,25 +1,34 @@
-"""Terminal-state predictor (Phase 1 skeleton).
+"""Terminal-state predictor (Phase 1).
 
 Inputs:
-  - prefix tokens: (B, K, max_objects, 13) — K frames of object-list features
+  - prefix tokens: (B, K, max_objects, 13) — K frames of object-list features.
   - prefix mask:   (B, K, max_objects)
-  - actions:       (B, K-1) action-id ints (optional, can be ignored at first)
-  - env_marker:    (B,) string identifier (optional fast-path conditioning)
+  - feature_mask:  (13,) bool — which features the model is allowed to see.
+                   Used for the invariance-feature-only ablation per the
+                   Phase 0c amendment.
 
 Output:
-  - predicted terminal token distribution: per-token (color logits, geometric mean+var)
-  - per-token mask logit (whether this token slot is "real" or "absent" at terminal)
+  Per-slot per-feature logit dicts. Heads are all categorical:
+    - color_id_logits   (B, n_slots, 256)
+    - color_rank_logits (B, n_slots, 32)
+    - log_size_logits   (B, n_slots, 32)         (HL-Gauss target)
+    - bbox_*_logits     (B, n_slots, 32) x 4     (HL-Gauss target)
+    - cx_logits, cy_logits  (B, n_slots, 32)     (HL-Gauss target)
+    - aspect_logits     (B, n_slots, 32)         (HL-Gauss target)
+    - log_neighbors_logits (B, n_slots, 16)      (HL-Gauss target)
+    - is_singleton_logit, touches_edge_logit  (B, n_slots) — BCE binary
+    - exists_logits     (B, n_slots) — BCE binary
 
-Architecture (skeleton):
-  - per-token MLP encodes the 13-feature vector to D-dim.
-  - per-frame transformer encoder (permutation-invariant within a frame; attention over tokens).
-  - inter-frame transformer encoder (attention over frames; uses learned per-frame position embedding).
-  - terminal-prediction head: queries the encoded sequence with a learned set of
-    "terminal slot" queries, decodes each into (color logits, geometric features).
+Architecture:
+  - per-token MLP encodes 13-feature vector to D-dim.
+  - within-frame transformer (permutation-invariant; geometry features
+    carry within-frame position info).
+  - cross-frame transformer with learned per-frame position embedding.
+  - learned terminal-slot queries cross-attend to encoded prefix.
 
-This file intentionally stops at the model definition. Training loop, loss
-functions (cross-entropy + flow-matching), and InfoNCE auxiliary land in
-scripts/train_predictor.py during Phase 1.
+Per the AlphaFold 2 / Trajectory Transformer / "Stop Regressing" pattern,
+all continuous outputs are predicted as classification over bins with
+HL-Gauss soft targets.
 """
 from __future__ import annotations
 
@@ -28,7 +37,34 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-_FEATURE_DIM = 13  # mirror models.object_list. ObjectToken.to_vector() output dim.
+from .discretize import (
+    BINARY_FEATURES,
+    CATEGORICAL_FEATURES,
+    CONTINUOUS_BIN_SPECS,
+    F_COLOR_ID,
+    F_COLOR_RANK,
+    F_LOG_SIZE,
+    F_LOG_NEIGHBORS,
+    F_ASPECT,
+    F_BBOX_XMIN,
+    F_BBOX_YMIN,
+    F_BBOX_XMAX,
+    F_BBOX_YMAX,
+    F_CX,
+    F_CY,
+    F_IS_SINGLETON,
+    F_TOUCHES_EDGE,
+    N_BINS_LOG_SIZE,
+    N_BINS_BBOX,
+    N_BINS_CENTROID,
+    N_BINS_ASPECT,
+    N_BINS_NEIGHBORS,
+    N_COLOR_ID,
+    N_COLOR_RANK,
+)
+
+
+_FEATURE_DIM = 13
 
 
 @dataclass
@@ -36,19 +72,19 @@ class PredictorConfig:
     feature_dim: int = _FEATURE_DIM
     embed_dim: int = 256
     n_heads: int = 8
-    n_token_layers: int = 2     # within-frame attention layers
-    n_frame_layers: int = 4     # cross-frame attention layers
+    n_token_layers: int = 2
+    n_frame_layers: int = 4
     max_objects: int = 128
     max_frames: int = 32
-    n_terminal_slots: int = 128 # number of "terminal token" queries
-    n_color_classes: int = 256  # cross-env color vocabulary cap
+    n_terminal_slots: int = 128
 
 
 class TokenEncoder(nn.Module):
-    """13-feature object token → embed_dim."""
+    """13-feature object token → embed_dim. Supports per-feature masking."""
 
     def __init__(self, feature_dim: int, embed_dim: int) -> None:
         super().__init__()
+        self.feature_dim = feature_dim
         self.mlp = nn.Sequential(
             nn.Linear(feature_dim, embed_dim),
             nn.GELU(),
@@ -56,99 +92,119 @@ class TokenEncoder(nn.Module):
             nn.LayerNorm(embed_dim),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, K, max_objects, feature_dim)
+    def forward(self, x: torch.Tensor,
+                feature_mask: torch.Tensor | None = None) -> torch.Tensor:
+        # x: (..., feature_dim). feature_mask: (feature_dim,) — 1=visible, 0=hidden.
+        if feature_mask is not None:
+            assert feature_mask.shape == (self.feature_dim,), \
+                f"feature_mask must be shape ({self.feature_dim},), got {feature_mask.shape}"
+            x = x * feature_mask.to(x.dtype).to(x.device)
         return self.mlp(x)
 
 
 class TerminalPredictor(nn.Module):
-    """Predicts the terminal-frame object list given a prefix of frames.
-
-    Skeleton — forward returns a structured output dict; training script wires
-    losses on top.
-    """
-
     def __init__(self, cfg: PredictorConfig) -> None:
         super().__init__()
         self.cfg = cfg
-        self.token_enc = TokenEncoder(cfg.feature_dim, cfg.embed_dim)
-        self.frame_pos_emb = nn.Embedding(cfg.max_frames, cfg.embed_dim)
-        self.token_pos_emb = nn.Embedding(cfg.max_objects, cfg.embed_dim)
+        D = cfg.embed_dim
 
-        # Within-frame transformer (permutation-invariant — no position emb on
-        # tokens within a frame; geometric features carry the position info).
+        self.token_enc = TokenEncoder(cfg.feature_dim, D)
+        self.frame_pos_emb = nn.Embedding(cfg.max_frames, D)
+
         within_layer = nn.TransformerEncoderLayer(
-            d_model=cfg.embed_dim,
-            nhead=cfg.n_heads,
-            dim_feedforward=cfg.embed_dim * 4,
-            batch_first=True,
-            activation="gelu",
+            d_model=D, nhead=cfg.n_heads, dim_feedforward=D * 4,
+            batch_first=True, activation="gelu",
         )
         self.within_frame_enc = nn.TransformerEncoder(within_layer, num_layers=cfg.n_token_layers)
 
-        # Cross-frame transformer (frames have order; use learned frame position emb).
         cross_layer = nn.TransformerEncoderLayer(
-            d_model=cfg.embed_dim,
-            nhead=cfg.n_heads,
-            dim_feedforward=cfg.embed_dim * 4,
-            batch_first=True,
-            activation="gelu",
+            d_model=D, nhead=cfg.n_heads, dim_feedforward=D * 4,
+            batch_first=True, activation="gelu",
         )
         self.cross_frame_enc = nn.TransformerEncoder(cross_layer, num_layers=cfg.n_frame_layers)
 
-        # Learned queries for terminal slots.
-        self.terminal_queries = nn.Parameter(
-            torch.randn(cfg.n_terminal_slots, cfg.embed_dim) * 0.02
-        )
+        self.terminal_queries = nn.Parameter(torch.randn(cfg.n_terminal_slots, D) * 0.02)
 
-        # Decoder layer: cross-attention from terminal queries to encoded prefix.
         decoder_layer = nn.TransformerDecoderLayer(
-            d_model=cfg.embed_dim,
-            nhead=cfg.n_heads,
-            dim_feedforward=cfg.embed_dim * 4,
-            batch_first=True,
-            activation="gelu",
+            d_model=D, nhead=cfg.n_heads, dim_feedforward=D * 4,
+            batch_first=True, activation="gelu",
         )
         self.terminal_decoder = nn.TransformerDecoder(decoder_layer, num_layers=2)
 
-        # Heads
-        self.color_head = nn.Linear(cfg.embed_dim, cfg.n_color_classes)
-        self.geom_head = nn.Linear(cfg.embed_dim, cfg.feature_dim - 1)  # everything except color
-        self.exists_head = nn.Linear(cfg.embed_dim, 1)  # binary: this slot is occupied
+        # Per-feature heads. All linear from embed_dim to bin count.
+        self.head_color_id = nn.Linear(D, N_COLOR_ID)
+        self.head_color_rank = nn.Linear(D, N_COLOR_RANK)
+        self.head_log_size = nn.Linear(D, N_BINS_LOG_SIZE)
+        self.head_bbox_xmin = nn.Linear(D, N_BINS_BBOX)
+        self.head_bbox_ymin = nn.Linear(D, N_BINS_BBOX)
+        self.head_bbox_xmax = nn.Linear(D, N_BINS_BBOX)
+        self.head_bbox_ymax = nn.Linear(D, N_BINS_BBOX)
+        self.head_cx = nn.Linear(D, N_BINS_CENTROID)
+        self.head_cy = nn.Linear(D, N_BINS_CENTROID)
+        self.head_aspect = nn.Linear(D, N_BINS_ASPECT)
+        self.head_log_neighbors = nn.Linear(D, N_BINS_NEIGHBORS)
+        self.head_is_singleton = nn.Linear(D, 1)
+        self.head_touches_edge = nn.Linear(D, 1)
+        self.head_exists = nn.Linear(D, 1)
 
-    def encode_prefix(self, tokens: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """Encode prefix into a (B, K * max_objects, D) sequence usable by the decoder.
-
-        Within-frame attention happens per frame (no cross-frame leakage).
-        Then frame position embedding is added and cross-frame attention happens.
-        """
+    def encode_prefix(self, tokens: torch.Tensor, mask: torch.Tensor,
+                      feature_mask: torch.Tensor | None = None
+                      ) -> tuple[torch.Tensor, torch.Tensor]:
         B, K, M, F = tokens.shape
         assert F == self.cfg.feature_dim
-        # Encode tokens
-        h = self.token_enc(tokens)  # (B, K, M, D)
-        # Within-frame attention (flatten B*K -> apply per-frame, reshape back).
+        h = self.token_enc(tokens, feature_mask=feature_mask)  # (B,K,M,D)
         h = h.reshape(B * K, M, -1)
-        within_mask = (mask.reshape(B * K, M) < 0.5)  # True = pad (ignore)
-        h = self.within_frame_enc(h, src_key_padding_mask=within_mask)
+        within_pad = (mask.reshape(B * K, M) < 0.5)
+        h = self.within_frame_enc(h, src_key_padding_mask=within_pad)
         h = h.reshape(B, K, M, -1)
-        # Add frame position embedding to each token's embedding
         frame_idx = torch.arange(K, device=tokens.device)
         h = h + self.frame_pos_emb(frame_idx)[None, :, None, :]
-        # Flatten across K and M for cross-frame attention
         h = h.reshape(B, K * M, -1)
-        cross_mask = (mask.reshape(B, K * M) < 0.5)
-        h = self.cross_frame_enc(h, src_key_padding_mask=cross_mask)
-        return h, cross_mask
+        cross_pad = (mask.reshape(B, K * M) < 0.5)
+        h = self.cross_frame_enc(h, src_key_padding_mask=cross_pad)
+        return h, cross_pad
 
-    def forward(self, tokens: torch.Tensor, mask: torch.Tensor) -> dict:
+    def forward(self, tokens: torch.Tensor, mask: torch.Tensor,
+                feature_mask: torch.Tensor | None = None) -> dict:
         B = tokens.shape[0]
-        memory, memory_mask = self.encode_prefix(tokens, mask)
+        memory, memory_pad = self.encode_prefix(tokens, mask, feature_mask=feature_mask)
         queries = self.terminal_queries.unsqueeze(0).expand(B, -1, -1)
         decoded = self.terminal_decoder(
-            tgt=queries, memory=memory, memory_key_padding_mask=memory_mask
-        )  # (B, n_terminal_slots, D)
+            tgt=queries, memory=memory, memory_key_padding_mask=memory_pad,
+        )  # (B, n_slots, D)
         return {
-            "color_logits": self.color_head(decoded),       # (B, n_slots, n_color_classes)
-            "geom": self.geom_head(decoded),                 # (B, n_slots, F-1)
-            "exists_logits": self.exists_head(decoded).squeeze(-1),  # (B, n_slots)
+            "color_id_logits":   self.head_color_id(decoded),
+            "color_rank_logits": self.head_color_rank(decoded),
+            "log_size_logits":   self.head_log_size(decoded),
+            "bbox_xmin_logits":  self.head_bbox_xmin(decoded),
+            "bbox_ymin_logits":  self.head_bbox_ymin(decoded),
+            "bbox_xmax_logits":  self.head_bbox_xmax(decoded),
+            "bbox_ymax_logits":  self.head_bbox_ymax(decoded),
+            "cx_logits":         self.head_cx(decoded),
+            "cy_logits":         self.head_cy(decoded),
+            "aspect_logits":     self.head_aspect(decoded),
+            "log_neighbors_logits": self.head_log_neighbors(decoded),
+            "is_singleton_logit":   self.head_is_singleton(decoded).squeeze(-1),
+            "touches_edge_logit":   self.head_touches_edge(decoded).squeeze(-1),
+            "exists_logits":     self.head_exists(decoded).squeeze(-1),
         }
+
+
+# Feature mask presets per the Phase 0c amendment.
+def feature_mask_full(device: torch.device) -> torch.Tensor:
+    return torch.ones(_FEATURE_DIM, device=device)
+
+
+def feature_mask_invariant(device: torch.device) -> torch.Tensor:
+    """Hide env-correlated absolute features (color_id, raw bbox coords).
+    Keep: color_rank (per-env normalized), log_size (relative scale),
+    centroids (normalized to [0,1]), aspect (ratio), structural booleans,
+    log_neighbors.
+    """
+    m = torch.ones(_FEATURE_DIM, device=device)
+    m[F_COLOR_ID] = 0.0
+    m[F_BBOX_XMIN] = 0.0
+    m[F_BBOX_YMIN] = 0.0
+    m[F_BBOX_XMAX] = 0.0
+    m[F_BBOX_YMAX] = 0.0
+    return m
