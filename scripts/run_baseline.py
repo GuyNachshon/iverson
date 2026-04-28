@@ -14,18 +14,21 @@ from typing import Any
 from arc_agi import OperationMode
 
 from agents.base import GameResult, make_arcade, run_agent
+from agents.iverson_v25 import IversonV25
 from agents.random_baseline import RandomBaseline
 
 
 def build_agent(name: str, game_id: str, baseline_actions: list[int]) -> Any:
     if name == "random":
         return RandomBaseline(game_id=game_id, baseline_actions=baseline_actions, seed=0)
+    if name == "v25":
+        return IversonV25(game_id=game_id, baseline_actions=baseline_actions, seed=0)
     raise ValueError(f"unknown agent: {name}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--agent", default="random", choices=["random"])
+    parser.add_argument("--agent", default="random", choices=["random", "v25"])
     parser.add_argument("--game", default=None, help="prefix filter, comma-separated")
     parser.add_argument("--max-actions", type=int, default=200)
     parser.add_argument("--mode", default="OFFLINE", choices=["OFFLINE", "ONLINE", "COMPETITION"])
