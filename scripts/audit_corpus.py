@@ -115,12 +115,49 @@ def audit(paths: list[Path]) -> None:
                   f"y range: [{cents[:, 1].min():.2f}, {cents[:, 1].max():.2f}]")
 
 
+def cross_env_summary(paths: list[Path]) -> None:
+    """Print cross-env totals + diversity per env_marker on one line each."""
+    rows = []
+    for p in paths:
+        rows.extend(read_trajectories(p))
+    by_marker: dict[str, list[dict]] = defaultdict(list)
+    for r in rows:
+        by_marker[r["env_marker"]].append(r)
+    print("\n## Cross-env summary")
+    total = 0
+    for marker, group in sorted(by_marker.items()):
+        n_unique_terms = 0
+        terms = set()
+        for r in group:
+            tokens, mask = unpack_frames(r)
+            if tokens.shape[0] == 0:
+                continue
+            final_t = tokens.shape[0] - 1
+            n = int(mask[final_t].sum())
+            sig = []
+            for k in range(n):
+                cid = int(tokens[final_t, k, 0])
+                cx = round(float(tokens[final_t, k, 7]), 2)
+                cy = round(float(tokens[final_t, k, 8]), 2)
+                sig.append((cid, cx, cy))
+            terms.add(tuple(sorted(sig)))
+        n_unique_terms = len(terms)
+        total += len(group)
+        print(f"  {marker:12s} n={len(group):5d}  unique_terminals={n_unique_terms:5d}  "
+              f"diversity={n_unique_terms/max(len(group),1):.0%}")
+    print(f"  TOTAL trajectories: {total}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("paths", nargs="+", help="parquet files to audit")
+    parser.add_argument("--summary-only", action="store_true",
+                        help="skip per-env detail, print only cross-env summary")
     args = parser.parse_args()
     paths = [Path(p) for p in args.paths]
-    audit(paths)
+    if not args.summary_only:
+        audit(paths)
+    cross_env_summary(paths)
 
 
 if __name__ == "__main__":

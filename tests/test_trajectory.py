@@ -56,8 +56,9 @@ def test_round_trip_single_trajectory() -> None:
         assert row["actions"] == [0, 1, 2, 3]
         # Unpack arrays
         tok, mask = unpack_frames(row)
-        assert tok.shape == (5, 64, 13)
-        assert mask.shape == (5, 64)
+        from models.trajectory import _MAX_OBJECTS_DEFAULT
+        assert tok.shape == (5, _MAX_OBJECTS_DEFAULT, 13)
+        assert mask.shape == (5, _MAX_OBJECTS_DEFAULT)
         # Per-frame n_objects matches what mask says
         for i in range(5):
             assert int(mask[i].sum()) == row["frame_n_objects"][i]
