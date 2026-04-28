@@ -51,6 +51,14 @@ DEFAULT_ENVS: list[str] = [
     "BabyAI-PutNextLocal-v0",   # place an object next to another
     "BabyAI-Synth-v0",          # mixed synthetic missions
     "BabyAI-GoToSeq-v0",        # navigate to a sequence of objects
+    "BabyAI-Pickup-v0",          # pick up any object
+    "BabyAI-UnblockPickup-v0",   # remove blocker before pickup
+    "BabyAI-Open-v0",            # open any door
+    "BabyAI-Unlock-v0",          # find key, unlock door
+    "BabyAI-PutNextS5N2-v0",     # place A next to B (cross-room small)
+    "BabyAI-KeyInBox-v0",        # find key inside box
+    "BabyAI-OpenDoorsOrderN2-v0",  # open doors in order
+    "BabyAI-MiniBossLevel-v0",   # composite mission (smaller than BossLevel)
 ]
 
 
@@ -72,9 +80,10 @@ def _encode_full_obs(env: gym.Env) -> np.ndarray:
     """
     base = env.unwrapped
     full_grid = base.grid.encode()  # (H, W, 3) — type, color, state
-    # Place agent token in the agent's cell
+    H, W, _ = full_grid.shape
     ax, ay = base.agent_pos
-    full_grid[ay, ax] = np.array([10, 0, base.agent_dir], dtype=np.int64)  # type=10 (agent)
+    if 0 <= ax < W and 0 <= ay < H:
+        full_grid[ay, ax] = np.array([10, 0, base.agent_dir], dtype=np.int64)  # type=10 (agent)
     return full_grid.astype(np.int64)
 
 
