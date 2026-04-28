@@ -38,3 +38,4 @@ data/
 # Claude Code local skill caches
 .agents/
 .claude/
+replays/
