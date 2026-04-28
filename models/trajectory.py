@@ -51,7 +51,7 @@ class Trajectory:
 # the Frame), and we lose nothing else. On load we reconstruct ObjectTokens
 # from the vector, which is sufficient for training (we use vectors directly).
 
-_MAX_OBJECTS_DEFAULT = 64
+_MAX_OBJECTS_DEFAULT = 128
 _FEATURE_DIM = 13
 
 

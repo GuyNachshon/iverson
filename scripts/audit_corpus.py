@@ -87,6 +87,27 @@ def audit(paths: list[Path]) -> None:
         unique_terminal_sets = len({frozenset(s) for s in terminal_color_id_lists})
         print(f"  distinct terminal color-id sets: {unique_terminal_sets} / {len(terminal_color_id_lists)}")
 
+        # Better terminal-diversity metric: signature = (sorted color_ids, sorted
+        # rounded-centroid-positions). Captures positional diversity that color
+        # sets miss (Sokoban, Sudoku, 15-puzzle all have identical color-id sets
+        # at terminal but vastly different positions).
+        terminal_pos_signatures: list[tuple] = []
+        for r in group:
+            tokens, mask = unpack_frames(r)
+            if tokens.shape[0] == 0:
+                continue
+            final_t = tokens.shape[0] - 1
+            n = int(mask[final_t].sum())
+            sig = []
+            for k in range(n):
+                cid = int(tokens[final_t, k, 0])
+                cx = round(float(tokens[final_t, k, 7]), 2)
+                cy = round(float(tokens[final_t, k, 8]), 2)
+                sig.append((cid, cx, cy))
+            terminal_pos_signatures.append(tuple(sorted(sig)))
+        unique_pos_sigs = len(set(terminal_pos_signatures))
+        print(f"  distinct terminal pos signatures: {unique_pos_sigs} / {len(terminal_pos_signatures)}")
+
         # Centroid distribution
         cents = np.asarray(all_centroids)
         if cents.size:

@@ -83,6 +83,26 @@ def test_to_array_padding() -> None:
     assert mask[2:].sum() == 0.0
 
 
+def test_frame_raw_is_copied_not_referenced() -> None:
+    """Regression: Frame.raw must hold a copy, not a reference to the caller's grid.
+
+    Bug history: collect_sudoku_one mutated `grid` in place and stored snapshots
+    via Frame; they all ended up showing the final state because Frame.raw shared
+    memory with the caller's mutating array.
+    """
+    g = np.zeros((4, 4), dtype=np.int64)
+    g[1, 1] = 3
+    f1 = grid_to_objects(g, env_marker="test")
+    g[1, 1] = 7  # mutate caller's array
+    g[2, 2] = 9
+    f2 = grid_to_objects(g, env_marker="test")
+    # f1.raw must reflect the original state, not the mutated one.
+    assert f1.raw[1, 1] == 3
+    assert f1.raw[2, 2] == 0
+    assert f2.raw[1, 1] == 7
+    assert f2.raw[2, 2] == 9
+
+
 def test_round_trip_simple() -> None:
     # Round-trip via objects_to_grid is bbox-fill, lossy in shape but should
     # preserve color in the bbox region.

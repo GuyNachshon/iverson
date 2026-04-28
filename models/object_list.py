@@ -225,7 +225,7 @@ def grid_to_objects(
 
     objects.sort(key=lambda o: (-o.size, o.bbox[1], o.bbox[0]))
 
-    return Frame(objects=objects, grid_shape=(H, W), env_marker=env_marker, raw=grid)
+    return Frame(objects=objects, grid_shape=(H, W), env_marker=env_marker, raw=grid.copy())
 
 
 # ---------------------------------------------------------------------------
