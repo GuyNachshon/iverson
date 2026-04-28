@@ -92,85 +92,126 @@ def per_env_perplexity(model: TerminalPredictor, paths: list[str], variant: str,
 
 
 def zero_shot_arc_agi_3(model: TerminalPredictor, variant: str,
-                          device: torch.device, n_steps: int = 5) -> None:
-    """Take a few action steps in ARC-AGI-3 envs, ask the predictor to predict
-    the terminal, and report sanity stats.
+                          device: torch.device, n_steps: int = 5,
+                          mode: str = "OFFLINE", limit: int | None = None,
+                          random_actions: bool = True) -> dict:
+    """Take a few action steps in each ARC-AGI-3 env, ask the predictor to
+    predict the terminal, and report aggregate stats across all envs.
+
+    Returns a per-env dict for further analysis.
     """
-    print("\n## Zero-shot ARC-AGI-3 transfer")
+    from collections import Counter
+
+    print(f"\n## Zero-shot ARC-AGI-3 transfer  (mode={mode})")
     try:
         from arc_agi import Arcade, OperationMode
+        from arcengine import GameAction
         from models.converters import arc_agi_3_to_frame
     except Exception as e:
         print(f"  (skipped: {e!r})")
-        return
+        return {}
 
-    arc = Arcade(operation_mode=OperationMode.OFFLINE)
+    arc = Arcade(operation_mode=OperationMode[mode])
     envs = arc.available_environments
     if not envs:
-        print("  (no local environments available)")
-        return
+        print("  (no environments available)")
+        return {}
 
     fmask = feature_mask_full(device) if variant == "full" else feature_mask_invariant(device)
+    rng = np.random.default_rng(0)
 
-    for info in envs[:3]:
+    if limit is not None:
+        envs = envs[:limit]
+
+    summary: dict = {}
+    counts = []
+    pred_color_hist: Counter = Counter()
+    last_color_hist: Counter = Counter()
+    print(f"  {'game_id':50s}  {'prefix':>6s}  {'last':>4s}  {'pred':>4s}  "
+          f"{'pred top colors':30s}  {'cx range':>16s}  {'cy range':>16s}")
+    for info in envs:
         env = arc.make(info.game_id)
         if env is None:
             continue
-        # Initial observation.
-        frames_list = [arc_agi_3_to_frame(env.observation_space)]
-        for _ in range(n_steps):
-            avail = env.observation_space.available_actions or [1]
-            from arcengine import GameAction
-            action = GameAction.from_id(avail[0])
-            data = {"game_id": info.game_id}
-            if action.is_complex():
-                data.update({"x": 32, "y": 32})
-            try:
-                env.step(action, data=data, reasoning={})
-                frames_list.append(arc_agi_3_to_frame(env.observation_space))
-            except Exception as e:
-                print(f"  {info.game_id}: step crashed {e!r}")
-                break
+        try:
+            frames_list = [arc_agi_3_to_frame(env.observation_space)]
+            for _ in range(n_steps):
+                avail = env.observation_space.available_actions or [1]
+                if random_actions:
+                    action_id = int(rng.choice(avail))
+                else:
+                    action_id = avail[0]
+                action = GameAction.from_id(action_id)
+                data = {"game_id": info.game_id}
+                if action.is_complex():
+                    data.update({"x": int(rng.integers(0, 64)),
+                                  "y": int(rng.integers(0, 64))})
+                try:
+                    env.step(action, data=data, reasoning={})
+                    frames_list.append(arc_agi_3_to_frame(env.observation_space))
+                except Exception:
+                    break
+        except Exception as e:
+            print(f"  {info.game_id}: env interaction crashed {e!r}")
+            continue
 
-        # Build prefix tensor.
         prefix_tokens = np.zeros((len(frames_list), 128, 13), dtype=np.float32)
         prefix_mask = np.zeros((len(frames_list), 128), dtype=np.float32)
         for k, f in enumerate(frames_list):
             tok, m = f.to_array(max_objects=128)
             prefix_tokens[k] = tok
             prefix_mask[k] = m
-        # Prepend a batch dim.
-        prefix_tokens = torch.from_numpy(prefix_tokens).unsqueeze(0).to(device)
-        prefix_mask = torch.from_numpy(prefix_mask).unsqueeze(0).to(device)
+        prefix_tokens_t = torch.from_numpy(prefix_tokens).unsqueeze(0).to(device)
+        prefix_mask_t = torch.from_numpy(prefix_mask).unsqueeze(0).to(device)
 
         with torch.no_grad():
-            out = model(prefix_tokens, prefix_mask, feature_mask=fmask)
+            out = model(prefix_tokens_t, prefix_mask_t, feature_mask=fmask)
 
-        # Decode predicted terminal: take exists>0.5 slots, decode their colors and centroids.
         exists_prob = torch.sigmoid(out["exists_logits"][0]).cpu().numpy()
         n_predicted = int((exists_prob > 0.5).sum())
         color_id_pred = out["color_id_logits"][0].argmax(-1).cpu().numpy()
         cx_dec = expected_value_decode(out["cx_logits"][0], 0.0, 1.0).cpu().numpy()
         cy_dec = expected_value_decode(out["cy_logits"][0], 0.0, 1.0).cpu().numpy()
 
-        # Compare with the prefix's last frame's color distribution.
-        last_n = int(prefix_mask[0, -1].sum())
-        last_colors = prefix_tokens[0, -1, :last_n, 0].cpu().numpy().astype(int)
+        last_n = int(prefix_mask[-1].sum())
+        last_colors = prefix_tokens[-1, :last_n, 0].astype(int).tolist()
+        active = exists_prob > 0.5
+        active_idx = np.where(active)[0]
+        pred_colors = [int(color_id_pred[i]) for i in active_idx]
+        cx_active = cx_dec[active] if active.any() else np.array([])
+        cy_active = cy_dec[active] if active.any() else np.array([])
 
-        print(f"\n  {info.game_id}  prefix_len={len(frames_list)}  "
-              f"prefix_objs(last)={last_n}")
-        print(f"    predicted exists count: {n_predicted}")
-        # Top predicted colors
-        from collections import Counter
-        top_pred_colors = Counter(int(color_id_pred[i]) for i in range(128)
-                                    if exists_prob[i] > 0.5).most_common(5)
-        print(f"    top predicted colors: {top_pred_colors}")
-        print(f"    last-frame colors:    {Counter(int(c) for c in last_colors).most_common(5)}")
-        # Centroid spread of predicted terminal slots
-        active_mask = exists_prob > 0.5
-        if active_mask.any():
-            print(f"    predicted centroid range: x=[{cx_dec[active_mask].min():.2f}, {cx_dec[active_mask].max():.2f}]  "
-                  f"y=[{cy_dec[active_mask].min():.2f}, {cy_dec[active_mask].max():.2f}]")
+        counts.append(n_predicted)
+        for c in pred_colors:
+            pred_color_hist[c] += 1
+        for c in last_colors:
+            last_color_hist[c] += 1
+
+        top_pred = Counter(pred_colors).most_common(3)
+        cx_range = (f"[{cx_active.min():.2f},{cx_active.max():.2f}]"
+                     if active.any() else "—")
+        cy_range = (f"[{cy_active.min():.2f},{cy_active.max():.2f}]"
+                     if active.any() else "—")
+        print(f"  {info.game_id:50s}  {len(frames_list):>6d}  {last_n:>4d}  "
+              f"{n_predicted:>4d}  {str(top_pred):30s}  {cx_range:>16s}  {cy_range:>16s}")
+
+        summary[info.game_id] = {
+            "prefix_len": len(frames_list),
+            "last_n_objs": last_n,
+            "pred_count": n_predicted,
+            "pred_top_colors": top_pred,
+            "last_top_colors": Counter(last_colors).most_common(3),
+        }
+
+    print(f"\n  ## aggregate over {len(summary)} games:")
+    if counts:
+        print(f"    pred_count: mean={np.mean(counts):.1f}  median={int(np.median(counts))}  "
+              f"zero={sum(1 for c in counts if c == 0)}  "
+              f"non-zero={sum(1 for c in counts if c > 0)}")
+        print(f"    top predicted colors (across all games): {pred_color_hist.most_common(5)}")
+        print(f"    top last-frame colors (across all games): {last_color_hist.most_common(5)}")
+
+    return summary
 
 
 def main() -> None:
@@ -179,6 +220,12 @@ def main() -> None:
     parser.add_argument("--paths", nargs="+",
                         default=sorted(str(p) for p in Path("data").glob("*.parquet")))
     parser.add_argument("--skip-arc-agi-3", action="store_true")
+    parser.add_argument("--arc-mode", default="OFFLINE",
+                        choices=["OFFLINE", "ONLINE", "COMPETITION"])
+    parser.add_argument("--arc-limit", type=int, default=None,
+                        help="cap the number of ARC-AGI-3 games to evaluate")
+    parser.add_argument("--arc-steps", type=int, default=5,
+                        help="action steps per ARC-AGI-3 game before predicting")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else
@@ -192,7 +239,10 @@ def main() -> None:
     per_env_perplexity(model, args.paths, variant, device)
 
     if not args.skip_arc_agi_3:
-        zero_shot_arc_agi_3(model, variant, device)
+        zero_shot_arc_agi_3(model, variant, device,
+                              n_steps=args.arc_steps,
+                              mode=args.arc_mode,
+                              limit=args.arc_limit)
 
 
 if __name__ == "__main__":
