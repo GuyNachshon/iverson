@@ -15,20 +15,29 @@ from arc_agi import OperationMode
 
 from agents.base import GameResult, make_arcade, run_agent
 from agents.iverson_v25 import IversonV25
+from agents.iverson_v3 import IversonV3
 from agents.random_baseline import RandomBaseline
 
 
-def build_agent(name: str, game_id: str, baseline_actions: list[int]) -> Any:
+def build_agent(name: str, game_id: str, baseline_actions: list[int],
+                ckpt: str | None = None) -> Any:
     if name == "random":
         return RandomBaseline(game_id=game_id, baseline_actions=baseline_actions, seed=0)
     if name == "v25":
         return IversonV25(game_id=game_id, baseline_actions=baseline_actions, seed=0)
+    if name == "v3":
+        if ckpt is None:
+            raise ValueError("v3 requires --ckpt path to a trained predictor")
+        return IversonV3(game_id=game_id, baseline_actions=baseline_actions,
+                          ckpt_path=ckpt, seed=0)
     raise ValueError(f"unknown agent: {name}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--agent", default="random", choices=["random", "v25"])
+    parser.add_argument("--agent", default="random", choices=["random", "v25", "v3"])
+    parser.add_argument("--ckpt", default=None,
+                        help="path to predictor checkpoint (required for v3)")
     parser.add_argument("--game", default=None, help="prefix filter, comma-separated")
     parser.add_argument("--max-actions", type=int, default=200)
     parser.add_argument("--mode", default="OFFLINE", choices=["OFFLINE", "ONLINE", "COMPETITION"])
@@ -53,7 +62,8 @@ def main() -> None:
         if env is None:
             print(f"  ! could not make env {info.game_id}")
             continue
-        agent = build_agent(args.agent, info.game_id, list(info.baseline_actions or []))
+        agent = build_agent(args.agent, info.game_id, list(info.baseline_actions or []),
+                              ckpt=args.ckpt)
         try:
             result = run_agent(agent, env, max_actions=args.max_actions)
         except Exception as e:
