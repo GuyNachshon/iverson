@@ -115,13 +115,20 @@ class TerminalPredictor(nn.Module):
             d_model=D, nhead=cfg.n_heads, dim_feedforward=D * 4,
             batch_first=True, activation="gelu",
         )
-        self.within_frame_enc = nn.TransformerEncoder(within_layer, num_layers=cfg.n_token_layers)
+        # enable_nested_tensor=False: MPS doesn't implement
+        # _nested_tensor_from_mask_left_aligned. Disabling this fast path
+        # keeps the implementation portable across MPS / CUDA / CPU.
+        self.within_frame_enc = nn.TransformerEncoder(
+            within_layer, num_layers=cfg.n_token_layers, enable_nested_tensor=False,
+        )
 
         cross_layer = nn.TransformerEncoderLayer(
             d_model=D, nhead=cfg.n_heads, dim_feedforward=D * 4,
             batch_first=True, activation="gelu",
         )
-        self.cross_frame_enc = nn.TransformerEncoder(cross_layer, num_layers=cfg.n_frame_layers)
+        self.cross_frame_enc = nn.TransformerEncoder(
+            cross_layer, num_layers=cfg.n_frame_layers, enable_nested_tensor=False,
+        )
 
         self.terminal_queries = nn.Parameter(torch.randn(cfg.n_terminal_slots, D) * 0.02)
 

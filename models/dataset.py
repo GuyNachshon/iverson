@@ -122,11 +122,22 @@ class TrajectoryDataset(Dataset):
         }
 
 
-def collate_fn(batch: list[dict], max_prefix_frames: int = 32) -> dict:
-    """Pad prefixes to a common length within the batch."""
+def collate_fn(batch: list[dict], max_prefix_frames: int = 32,
+                fixed_pad: bool = True) -> dict:
+    """Pad prefixes to a common length within the batch.
+
+    `fixed_pad=True`: pad to `max_prefix_frames` for every batch. Enables MPS
+    kernel reuse across batches (variable-shape recompiles every step). Wastes
+    some compute per batch but is much faster overall on Apple Silicon.
+
+    `fixed_pad=False`: pad only to the max length within the batch.
+    """
     B = len(batch)
-    max_prefix = max(b["prefix_tokens"].shape[0] for b in batch)
-    max_prefix = min(max_prefix, max_prefix_frames)
+    if fixed_pad:
+        max_prefix = max_prefix_frames
+    else:
+        max_prefix = max(b["prefix_tokens"].shape[0] for b in batch)
+        max_prefix = min(max_prefix, max_prefix_frames)
     M = batch[0]["target_tokens"].shape[0]
     F = batch[0]["target_tokens"].shape[1]
 

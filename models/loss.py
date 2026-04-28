@@ -159,19 +159,22 @@ def predictor_loss(
 
     total = color_loss + geom_loss + binary_loss + exists_loss_total
 
+    def _f(t: torch.Tensor) -> float:
+        return float(t.detach())
+
     diag = {
-        "loss_color_id": float(loss_color_id),
-        "loss_color_rank": float(loss_color_rank),
-        "loss_log_size": float(loss_log_size),
-        "loss_bbox": float(loss_bbox_xmin + loss_bbox_ymin + loss_bbox_xmax + loss_bbox_ymax) / 4.0,
-        "loss_cx": float(loss_cx),
-        "loss_cy": float(loss_cy),
-        "loss_aspect": float(loss_aspect),
-        "loss_log_neighbors": float(loss_log_neighbors),
-        "loss_is_singleton": float(loss_is_singleton),
-        "loss_touches_edge": float(loss_touches_edge),
-        "loss_exists": float(exists_loss_mean),
-        "n_valid_slots": float(n_valid),
-        "total": float(total),
+        "loss_color_id": _f(loss_color_id),
+        "loss_color_rank": _f(loss_color_rank),
+        "loss_log_size": _f(loss_log_size),
+        "loss_bbox": _f(loss_bbox_xmin + loss_bbox_ymin + loss_bbox_xmax + loss_bbox_ymax) / 4.0,
+        "loss_cx": _f(loss_cx),
+        "loss_cy": _f(loss_cy),
+        "loss_aspect": _f(loss_aspect),
+        "loss_log_neighbors": _f(loss_log_neighbors),
+        "loss_is_singleton": _f(loss_is_singleton),
+        "loss_touches_edge": _f(loss_touches_edge),
+        "loss_exists": _f(exists_loss_mean),
+        "n_valid_slots": _f(n_valid),
+        "total": _f(total),
     }
     return total, diag
